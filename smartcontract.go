@@ -14,9 +14,9 @@ type Ciphertext struct {
 }
 
 type Proposal struct {
-	NoisyModel           []float64 	`json:"noisymodel"`		// 加噪模型 
-	EncryptedModel       Ciphertext	`json:"encryptedmodel"`		// 加密模型
-	EncryptedNoisy       Ciphertext	`json:"encryptenoisy"`		// 加密噪声
+	NoisyModel           []float64 	`json:"noisymodel"`				// 加噪模型 
+	EncryptedModel       Ciphertext	`json:"encryptedmodel"`			// 加密模型
+	EncryptedNoisy       Ciphertext	`json:"encryptenoisy"`			// 加密噪声
 	EncryptedNoisyModel  Ciphertext `json:"encryptednoisymodel"`	// 加密加噪模型
 }
 
@@ -56,7 +56,7 @@ func (c *Chaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 			return shim.Error(err.Error())
 		}
 
-		signature, err := c.Endorsement(proposal)
+		signature err:= c.Endorsement(proposal)
 		if err != nil {
 			return shim.Error(err.Error())
 		}
@@ -74,7 +74,7 @@ func (c *Chaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 		return shim.Success(updateBytes)
 	}
 
-	return shim.Error("Invalid invoke function name. Expecting \"endorsement\"")
+	return shim.Error(fmt.Sprintf("无效的%s方法", fn))
 }
 
 func getProposal(stub shim.ChaincodeStubInterface) (Proposal, error) {
@@ -105,7 +105,7 @@ func getUpdate(stub shim.ChaincodeStubInterface) (Update, error) {
 	return update, nil
 }
 
-func (c *Chaincode) Endorsement(stub shim.ChaincodeStubInterface) pb.Response {
+func (c *Chaincode) Endorsement(stub shim.ChaincodeStubInterface) (pb.Response, error) {
 	proposal, err := getProposal(stub) 
 	if err != nil { 
 		return shim.Error(err.Error()) 
@@ -126,7 +126,7 @@ func (c *Chaincode) Endorsement(stub shim.ChaincodeStubInterface) pb.Response {
 		return shim.Error(err.Error()) 
 	}
 
-	return shim.Success(signature) 
+	return shim.Success(signature), nil
 }
 
 func multikrum(noisyModel []float64) bool {

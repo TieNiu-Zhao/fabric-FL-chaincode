@@ -34,28 +34,6 @@ type SmartContract struct {
 	contractapi.Contract
 }
 
-// QueryModel从世界状态返回当前加密模型
-func (s *SmartContract) QueryModel(ctx contractapi.TransactionContextInterface) (*Ciphertext, error) {
-	// 使用键"model"从世界状态中获取模型
-	modelBytes, err := ctx.GetStub().GetState("model")
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get model from world state")
-	}
-
-	if modelBytes == nil {
-		return nil, errors.New("model does not exist")
-	}
-
-	// 将模型字节解编组为密文实例
-	var model Ciphertext
-	err = json.Unmarshal(modelBytes, &model)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to unmarshal model")
-	}
-
-	return &model, nil
-}
-
 // ProposeUpdate从客户端接收更新加密模型的提议，并将其广播到认可的 Peers
 func (s *SmartContract) ProposeUpdate(ctx contractapi.TransactionContextInterface, proposal *Proposal) (*Proposal, error) {
 	// 验证来自客户端的建议

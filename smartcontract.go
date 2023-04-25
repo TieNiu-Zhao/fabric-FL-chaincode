@@ -9,37 +9,49 @@ import (
 	"github.com/pkg/errors"
 )
 
-// Ciphertext represents a complex number with real and imaginary parts
 type Ciphertext struct {
-	ax []int64 // Real part
-	bx []int64 // Imaginary part
+	ax []int64 // 实部
+	bx []int64 // 虚部 
 }
 
-// Proposal represents a proposal for updating the encrypted model
 type Proposal struct {
-	NoisyModel          []float64  `json:"noisymodel"`          // Noisy model
-	EncryptedModel      Ciphertext `json:"encryptedmodel"`      // Encrypted model
-	EncryptedNoisy      Ciphertext `json:"encryptenoisy"`       // Encrypted noise
-	EncryptedNoisyModel Ciphertext `json:"encryptednoisymodel"` // Encrypted noisy model
+	NoisyModel          []float64  `json:"noisymodel"`          // 加噪模型 
+	EncryptedModel      Ciphertext `json:"encryptedmodel"`      // 加密模型
+	EncryptedNoisy      Ciphertext `json:"encryptenoisy"`       // 加密噪声
+	EncryptedNoisyModel Ciphertext `json:"encryptednoisymodel"` // 加密加噪模型
 }
 
-// UpdateRequest represents a request for updating the encrypted model with endorsements
 type UpdateRequest struct {
-	EncryptedModel Ciphertext           `json:"encryptedmodel"` // The encrypted model from the proposal
-	Endorsements   []*peer.Endorsement `json:"endorsements"`   // The endorsements from the endorsing peers
+	EncryptedModel Ciphertext           `json:"encryptedmodel"` // 来自 proposal 的 EncryptedModel
+	Endorsements   []*peer.Endorsement `json:"endorsements"`   	// 来自 endorsing peers 的结果
 }
 
-// SmartContract provides functions for managing an encrypted model
 type SmartContract struct {
 	contractapi.Contract
 }
 
-// ProposeUpdate从客户端接收更新加密模型的提议，并将其广播到认可的 Peers
+var num int = 10	// update数，初始为10
+var q int64 = 800	// 模数q
+
+// ProposeUpdate 从客户端接收更新加密模型的提议，并将其广播到认可的 Peers
 func (s *SmartContract) ProposeUpdate(ctx contractapi.TransactionContextInterface, proposal *Proposal) (*Proposal, error) {
 	// 验证来自客户端的建议
 	err := s.ValidateProposal(ctx, proposal)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to validate proposal")
+	}
+
+	if !multikrum(proposal.NoisyModel) {
+		num--
+		return nil, errors.New("投毒检测不通过") 
+	}
+	
+	// 使用 addCipher 方法将 proposal.EncryptedModel 与 proposal.EncryptedNoisy 相加
+	sum := addCipher(proposal.EncryptedModel, proposal.EncryptedNoisy)
+
+	if !equal(sum, EncryptedNoisyModel) {
+		num--
+		return nil, errors.New("同态加法验证不通过") 
 	}
 
 	// 将提案广播给赞同的 Peers
@@ -67,7 +79,7 @@ func (s *SmartContract) ProposeUpdate(ctx contractapi.TransactionContextInterfac
 		return nil, errors.Wrap(err, "failed to send proposal")
 	}
 
-	// 从回答中提取背书
+	// 从响应中提取背书
 	endorsements := make([]*peer.Endorsement, len(responses))
 	for i, r := range responses {
 		endorsements[i] = r.Endorsement
@@ -79,24 +91,66 @@ func (s *SmartContract) ProposeUpdate(ctx contractapi.TransactionContextInterfac
 		Endorsements:   endorsements,
 	}
 
-	// 用更新请求创建一个更新请求事务
-	urt, err := sdk.NewUpdateRequestTransaction(update)
+	// 将更新请求发送给排序节点
+    err = s.SendUpdate(ctx, update)
+    if err != nil {
+        return nil, errors.Wrap(err, "failed to send update")
+    }
+
+    // 调用 OrderUpdate 方法
+    response, err := ctx.GetStub().InvokeChaincode("mychaincode", [][]byte{[]byte("OrderUpdate"), []byte(update)}, "mychannel")
+    if err != nil {
+        return nil, errors.Wrap(err, "failed to invoke OrderUpdate")
+    }
+
+    // 检查响应是否有效
+    if response.Status != peer.TxValidationCode_VALID {
+        return nil, errors.New("OrderUpdate was not valid")
+    }
+
+	return response.Payload.([]byte), nil
+}
+
+func (s *SmartContract) OrderUpdate(ctx contractapi.TransactionContextInterface, updates []*UpdateRequest) error {
+	// 验证来自客户端的更新请求
+	err := s.ValidateUpdates(ctx, updates)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create update request transaction")
+		return errors.Wrap(err, “failed to validate updates”)
+	}
+	// 使用 addCipher 方法对 num 个更新请求中的加密模型进行累加
+	sum := Ciphertext{}
+	for i := 0; i < num; i++ {
+		sum = addCipher(sum, updates[i].EncryptedModel)
 	}
 
-	// 将更新请求事务发送到排序服务并获得其响应
-	response, err := sdk.SendTransaction(urt)
+	// 将累加结果上传到最新区块上
+	err = s.PutState(ctx, "latest_model", sum)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to send transaction")
+		return errors.Wrap(err, "failed to put state")
 	}
 
-	// 检查响应状态
-	if response.Status != peer.TxValidationCode_VALID {
-		return nil, errors.New("transaction was not valid")
+	// 将 num 恢复为 10
+	num = 10
+	return nil
+}
+
+// 定义一个查询函数，只返回 Ciphertext 里的 bx 部分 
+func (s *SmartContract) QueryBx(ctx contractapi.TransactionContextInterface) (string, error) {
+	// 从状态数据库中获取最新的加密模型 
+	encryptedModel, err := ctx.GetStub().GetState(“latest_model”) 
+	if err != nil { 
+		return “”, errors.Wrap(err, “failed to get state”) 
 	}
 
-	return response, nil
+	// 将加密模型转换为 Ciphertext 结构体
+	var ciphertext Ciphertext
+	err = json.Unmarshal(encryptedModel, &ciphertext)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to unmarshal ciphertext")
+	}
+
+	// 只返回 bx 部分
+	return ciphertext.Bx, nil
 }
 
 func multikrum(noisyModel []float64) bool {

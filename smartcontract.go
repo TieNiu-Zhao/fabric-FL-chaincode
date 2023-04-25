@@ -4,129 +4,121 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/hyperledger/fabric-chaincode-go/shim"
-	pb "github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric-contract-api-go/contractapi"
+	"github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/pkg/errors"
 )
 
-type Ciphertext struct { 
-	ax []int64 // 实部 
-	bx []int64 // 虚部 
+// Ciphertext represents a complex number with real and imaginary parts
+type Ciphertext struct {
+	ax []int64 // Real part
+	bx []int64 // Imaginary part
 }
 
+// Proposal represents a proposal for updating the encrypted model
 type Proposal struct {
-	NoisyModel           []float64 	`json:"noisymodel"`				// 加噪模型 
-	EncryptedModel       Ciphertext	`json:"encryptedmodel"`			// 加密模型
-	EncryptedNoisy       Ciphertext	`json:"encryptenoisy"`			// 加密噪声
-	EncryptedNoisyModel  Ciphertext `json:"encryptednoisymodel"`	// 加密加噪模型
+	NoisyModel          []float64  `json:"noisymodel"`          // Noisy model
+	EncryptedModel      Ciphertext `json:"encryptedmodel"`      // Encrypted model
+	EncryptedNoisy      Ciphertext `json:"encryptenoisy"`       // Encrypted noise
+	EncryptedNoisyModel Ciphertext `json:"encryptednoisymodel"` // Encrypted noisy model
 }
 
-type Endorsement struct {
-	Endorser    string `json:"endorser"`
-	Signature   []byte `json:"signature"`
+// UpdateRequest represents a request for updating the encrypted model with endorsements
+type UpdateRequest struct {
+	EncryptedModel Ciphertext           `json:"encryptedmodel"` // The encrypted model from the proposal
+	Endorsements   []*peer.Endorsement `json:"endorsements"`   // The endorsements from the endorsing peers
 }
 
-type Update struct {
-	Endorsements     []Endorsement 	`json:"endorsements"` 	// 背书结果
-	EncryptedModel   []Ciphertext   `json:"encryptedmodel"`	// 加密模型
+// SmartContract provides functions for managing an encrypted model
+type SmartContract struct {
+	contractapi.Contract
 }
 
-var num int 			// 通过背书的客户端数量 
-var q int64				// 同态加密的模参数 
-var sum Ciphertext 		// 密文求和结果
-
-type Chaincode struct {
-}
-
-
-func (c *Chaincode) Init(stub shim.ChaincodeStubInterface) pb.Response {
-	return shim.Success(nil)
-}
-
-func (c *Chaincode) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
-	function, args := stub.GetFunctionAndParameters()
-
-	if function == "endorsement" {
-		if len(args) != 1 {
-			return shim.Error("Incorrect number of arguments. Expecting 1")
-		}
-
-		var proposal Proposal
-		err := json.Unmarshal([]byte(args[0]), &proposal)
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-
-		signature err:= c.Endorsement(proposal)
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-
-		update := Update{
-			Endorsements:   []Endorsement{{Endorser: mspID, Signature: signature}},
-			EncryptedModel: proposal.EncryptedModel,
-		}
-
-		updateBytes, err := json.Marshal(update)
-		if err != nil {
-			return shim.Error(err.Error())
-		}
-
-		return shim.Success(updateBytes)
-	}
-
-	return shim.Error(fmt.Sprintf("无效的%s方法", fn))
-}
-
-func getProposal(stub shim.ChaincodeStubInterface) (Proposal, error) {
-	// 从交易参数中获取proposal
-	args := stub.GetArgs() 
-	if len(args) != 1 { 
-		return Proposal{}, errors.New("参数个数不正确") 
-	}
-	var proposal Proposal
-	err := json.Unmarshal(args[0], &proposal)
+// QueryModel从世界状态返回当前加密模型
+func (s *SmartContract) QueryModel(ctx contractapi.TransactionContextInterface) (*Ciphertext, error) {
+	// 使用键"model"从世界状态中获取模型
+	modelBytes, err := ctx.GetStub().GetState("model")
 	if err != nil {
-		return Proposal{}, errors.New("参数格式不正确")
+		return nil, errors.Wrap(err, "failed to get model from world state")
 	}
-	return proposal, nil
+
+	if modelBytes == nil {
+		return nil, errors.New("model does not exist")
+	}
+
+	// 将模型字节解编组为密文实例
+	var model Ciphertext
+	err = json.Unmarshal(modelBytes, &model)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to unmarshal model")
+	}
+
+	return &model, nil
 }
 
-func getUpdate(stub shim.ChaincodeStubInterface) (Update, error) {
-	// 从交易参数中获取update
-	args := stub.GetArgs()
-	if len(args) != 1 {
-		return Update{}, errors.New("参数个数不正确")
-	}
-	var update Update
-	err := json.Unmarshal(args[0], &update)
+// ProposeUpdate从客户端接收更新加密模型的提议，并将其广播到认可的 Peers
+func (s *SmartContract) ProposeUpdate(ctx contractapi.TransactionContextInterface, proposal *Proposal) (*Proposal, error) {
+	// 验证来自客户端的建议
+	err := s.ValidateProposal(ctx, proposal)
 	if err != nil {
-		return Update{}, errors.New("参数格式不正确")
-	}
-	return update, nil
-}
-
-func (c *Chaincode) Endorsement(stub shim.ChaincodeStubInterface) (pb.Response, error) {
-	proposal, err := getProposal(stub) 
-	if err != nil { 
-		return shim.Error(err.Error()) 
+		return nil, errors.Wrap(err, "failed to validate proposal")
 	}
 
-	if !multikrum(proposal.NoisyModel) {
-		return shim.Error("投毒检测不通过") 
-	}
-
-	if !equal(addCipher(proposal.EncryptedModel, proposal.Sum), sum) {
-		return shim.Error("同态加法验证不通过") 
-	}
-
-	num++
-	sum = addCipher(sum, proposal.EncryptedModel)
-	signature, err := sign(proposal) 
+	// 将提案广播给赞同的 Peers
+	// 获取链码背书策略
+	ep, err := sdk.GetEndorsementPolicy("mychaincode")
 	if err != nil {
-		return shim.Error(err.Error()) 
+		return nil, errors.Wrap(err, "failed to get endorsement policy")
 	}
 
-	return shim.Success(signature), nil
+	// 从背书策略中获取 Endorsing Peers
+	endorsers, err := ep.GetEndorsers()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get endorsers")
+	}
+
+	// 用提案创建一个提案请求
+	pr, err := sdk.NewProposalRequest(proposal)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create proposal request")
+	}
+
+	// 将提案请求发送到支持节点，并获得它们的响应
+	responses, err := sdk.SendProposal(pr, endorsers)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to send proposal")
+	}
+
+	// 从回答中提取背书
+	endorsements := make([]*peer.Endorsement, len(responses))
+	for i, r := range responses {
+		endorsements[i] = r.Endorsement
+	}
+
+	// 使用加密模型和背书创建更新请求
+	update := &UpdateRequest{
+		EncryptedModel: proposal.EncryptedModel,
+		Endorsements:   endorsements,
+	}
+
+	// 用更新请求创建一个更新请求事务
+	urt, err := sdk.NewUpdateRequestTransaction(update)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create update request transaction")
+	}
+
+	// 将更新请求事务发送到排序服务并获得其响应
+	response, err := sdk.SendTransaction(urt)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to send transaction")
+	}
+
+	// 检查响应状态
+	if response.Status != peer.TxValidationCode_VALID {
+		return nil, errors.New("transaction was not valid")
+	}
+
+	return response, nil
 }
 
 func multikrum(noisyModel []float64) bool {
@@ -166,7 +158,7 @@ func multikrum(noisyModel []float64) bool {
 	return false
 }
 
-func addCipher(cipherA, cipherB Ciphertext, q int64) Ciphertext {
+func addCipher(cipherA, cipherB Ciphertext) Ciphertext {
 	var cipherC Ciphertext 
 	for i := 0; i < len(cipherA.ax); i++ {
 		cipherC.ax[i] = (cipherA.ax[i] + cipherB.ax[i]) % q // 实部相加取模
@@ -182,64 +174,4 @@ func equal(cipherA, cipherB Ciphertext) bool {
 		} 
 	}
 	return true
-}
-
-func sign(proposal Proposal) ([]byte, error) {
-	// 获取背书节点的私钥 
-	privKey, err := getPrivateKey() 
-	if err != nil {
-		return nil, err
-	}
-	// 将proposal转换为字节数组 
-	proposalBytes, err := json.Marshal(proposal)
-	if err != nil {
-		return nil, err
-	}
-	// 使用私钥对proposal进行签名 
-	signature, err := ecdsa.SignASN1(rand.Reader, privKey, proposalBytes)
-	if err != nil {
-		return nil, err
-	}
-	// 返回签名结果 
-	return signature, nil
-}
-
-func verify(endorsements []byte) bool {
-	// 获取背书节点的公钥 
-	pubKey, err := getPublicKey()
-	if err != nil {
-		return false
-	}
-	// 将endorsements分割为proposal和signature两部分 
-	proposal := endorsements[:len(endorsements)-64]
-	signature := endorsements[len(endorsements)-64:]
-	// 使用公钥对signature进行验证 
-	valid, err := ecdsa.VerifyASN1(pubKey, proposal, signature)
-	if err != nil {
-		return false
-	}
-	// 返回验证结果 
-	return valid
-}
-
-func (c *Chaincode) upload(stub shim.ChaincodeStubInterface) pb.Response {
-	update, err := getUpdate(stub)
-	if err != nil {
-		return shim.Error(err.Error()) 
-	}
-	if !verify(update.Endorsements) {
-		return shim.Error("背书结果验证不通过") 
-	} 
-	// 同态加法求和，并上传到最新区块 
-	var total Ciphertext // 总和密文 
-	for i := 0; i < num; i++ {
-		total = addCipher(total, update.EncryptedModel[i]) 
-	}
-	err = stub.PutState(“total”, total) 
-	// 将总和密文存储到最新区块的状态数据库中 
-	if err != nil { 
-		return shim.Error(err.Error()) 
-	}
-
-	return shim.Success(nil)
 }

@@ -4,10 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/hyperledger/fabric-contract-api-go/contractapi"
-	"github.com/hyperledger/fabric-protos-go/peer"
-	"github.com/pkg/errors"
-)
+	"github.com/hyperledger/fabric-chaincode-go/shim"
+	pb "github.com/hyperledger/fabric-protos-go/peer"
+) 
 
 type Ciphertext struct {
 	ax []int64 // 实部
@@ -23,100 +22,110 @@ type Proposal struct {
 
 type UpdateRequest struct {
 	EncryptedModel Ciphertext           `json:"encryptedmodel"` // 来自 proposal 的 EncryptedModel
-	Endorsements   []*peer.Endorsement `json:"endorsements"`   	// 来自 endorsing peers 的结果
+	Endorsements   []*pb.Endorsement 	`json:"endorsements"`   // 来自 endorsing peers 的结果
 }
 
 type SmartContract struct {
-	contractapi.Contract
 }
 
 var num int = 10	// update数，初始为10
 var q int64 = 800	// 模数q
 
-// ProposeUpdate 从客户端接收更新加密模型的提议，并将其广播到认可的 Peers
-func (s *SmartContract) ProposeUpdate(ctx contractapi.TransactionContextInterface, proposal *Proposal) (*Proposal, error) {
-	// 验证来自客户端的建议
-	err := s.ValidateProposal(ctx, proposal)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to validate proposal")
-	}
+func (s *SmartContract) Init(stub shim.ChaincodeStubInterface) pb.Response {
+	return shim.Success(nil)
+}
 
+func (s *SmartContract) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
+	// 获取函数名和参数
+	function, args := stub.GetFunctionAndParameters()
+
+	
+}
+
+// ProposeUpdate 从客户端接收更新加密模型的提议，并将其广播到认可的 Peers 
+func (s *SmartContract) ProposeUpdate(stub shim.ChaincodeStubInterface, proposal *Proposal) pb.Response { 
+	// 检查提议是否为空 
+	if proposal == nil {
+		return shim.Error("提议不能为空")
+	}
+	// 对提议中的加噪模型进行投毒检测
 	if !multikrum(proposal.NoisyModel) {
 		num--
-		return nil, errors.New("投毒检测不通过") 
+		return shim.Error("投毒检测不通过")
 	}
-	
-	// 使用 addCipher 方法将 proposal.EncryptedModel 与 proposal.EncryptedNoisy 相加
+
+	// 使用 addCipher 方法将提议中的加密模型与加密噪声相加
 	sum := addCipher(proposal.EncryptedModel, proposal.EncryptedNoisy)
 
-	if !equal(sum, EncryptedNoisyModel) {
+	// 检查加密模型与加密噪声的同态加法是否与提议中的加密加噪模型相等
+	if !equal(sum, proposal.EncryptedNoisyModel) {
 		num--
-		return nil, errors.New("同态加法验证不通过") 
+		return shim.Error("同态加法验证不通过")
 	}
 
-	// 将提案广播给赞同的 Peers
-	// 获取链码背书策略
-	ep, err := sdk.GetEndorsementPolicy("mychaincode")
+	// 如果验证通过，获取当前交易的背书结果
+	endorsements, err := stub.GetEndorsements()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to get endorsement policy")
+		return shim.Error(fmt.Sprintf("获取背书结果失败: %s", err))
 	}
 
-	// 从背书策略中获取 Endorsing Peers
-	endorsers, err := ep.GetEndorsers()
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get endorsers")
-	}
-
-	// 用提案创建一个提案请求
-	pr, err := sdk.NewProposalRequest(proposal)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create proposal request")
-	}
-
-	// 将提案请求发送到支持节点，并获得它们的响应
-	responses, err := sdk.SendProposal(pr, endorsers)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to send proposal")
-	}
-
-	// 从响应中提取背书
-	endorsements := make([]*peer.Endorsement, len(responses))
-	for i, r := range responses {
-		endorsements[i] = r.Endorsement
-	}
-
-	// 使用加密模型和背书创建更新请求
+	// 将背书结果与提议中的加密模型拼装成更新请求
 	update := &UpdateRequest{
 		EncryptedModel: proposal.EncryptedModel,
 		Endorsements:   endorsements,
 	}
 
-	// 将更新请求发送给排序节点
-    err = s.SendUpdate(ctx, update)
-    if err != nil {
-        return nil, errors.Wrap(err, "failed to send update")
-    }
+	// 将更新请求序列化为字节
+	updateBytes, err := json.Marshal(update)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("序列化更新请求失败: %s", err))
+	}
 
-    // 调用 OrderUpdate 方法
-    response, err := ctx.GetStub().InvokeChaincode("mychaincode", [][]byte{[]byte("OrderUpdate"), []byte(update)}, "mychannel")
-    if err != nil {
-        return nil, errors.Wrap(err, "failed to invoke OrderUpdate")
-    }
+	// 调用 upload 方法将更新请求发送给排序节点
+	resp := s.upload(stub, updateBytes)
+	if resp.Status != shim.OK {
+		return resp
+	}
 
-    // 检查响应是否有效
-    if response.Status != peer.TxValidationCode_VALID {
-        return nil, errors.New("OrderUpdate was not valid")
-    }
-
-	return response.Payload.([]byte), nil
+	return shim.Success(nil)
 }
 
-func (s *SmartContract) OrderUpdate(ctx contractapi.TransactionContextInterface, updates []*UpdateRequest) error {
-	// 验证来自客户端的更新请求
-	err := s.ValidateUpdates(ctx, updates)
-	if err != nil {
-		return errors.Wrap(err, “failed to validate updates”)
+// upload 方法将更新请求发送给排序节点，并等待排序结果
+func (s *SmartContract) upload(stub shim.ChaincodeStubInterface, update []byte) pb.Response { 
+	// 检查更新请求是否为空
+	if update == nil {
+		return shim.Error("更新请求不能为空")
 	}
+
+	// 创建一个新的交易提案，指定链码名称、通道名称、函数名和参数
+	prop, _, err := stub.CreateProposalFromBytes("mycc", stub.GetChannelID(), "upload", [][]byte{update})
+	if err != nil {
+		return shim.Error(fmt.Sprintf("创建交易提案失败: %s", err))
+	}
+
+	// 将交易提案发送给排序节点，并等待排序结果
+	resp, err := stub.SendProposalToOrderer(prop)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("发送交易提案失败: %s", err))
+	}
+
+	// 检查排序结果是否成功
+	if resp.Status != shim.OK {
+		return resp
+	}
+
+	// 从排序结果中获取更新请求的数组
+	var updates []*UpdateRequest
+	err = json.Unmarshal(resp.Payload, &updates)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("反序列化更新请求失败: %s", err))
+	}
+
+	// 检查更新请求的数量是否等于 num
+	if len(updates) != num {
+		return shim.Error(fmt.Sprintf("更新请求的数量不匹配: 预期 %d, 实际 %d", num, len(updates)))
+	}
+
 	// 使用 addCipher 方法对 num 个更新请求中的加密模型进行累加
 	sum := Ciphertext{}
 	for i := 0; i < num; i++ {
@@ -124,33 +133,114 @@ func (s *SmartContract) OrderUpdate(ctx contractapi.TransactionContextInterface,
 	}
 
 	// 将累加结果上传到最新区块上
-	err = s.PutState(ctx, "latest_model", sum)
+	err = stub.PutState("latest_model", sum)
 	if err != nil {
-		return errors.Wrap(err, "failed to put state")
+		return shim.Error(fmt.Sprintf("failed to put state: %s", err))
+	}
+
+	return shim.Success(nil)
+}
+
+// query 方法根据键查询最新块的内容
+func (s *SmartContract) query(stub shim.ChaincodeStubInterface, key string) pb.Response { 
+	// 检查键是否为空 
+	if key == “” { 
+		return shim.Error("键不能为空") 
+	}
+
+	// 根据键从最新块中获取值
+	value, err := stub.GetState(key)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("获取状态失败: %s", err))
+	}
+
+	// 检查值是否为空
+	if value == nil {
+		return shim.Error("找不到对应的值")
+	}
+
+	// 将值反序列化为Ciphertext结构体
+	var ciphertext Ciphertext
+	err = json.Unmarshal(value, &ciphertext)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("反序列化失败: %s", err))
+	}
+
+	// 将Ciphertext结构体的ax部分保存到一个私有数据集合中
+	axBytes, err := json.Marshal(ciphertext.ax)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("序列化失败: %s", err))
+	}
+	err = stub.PutPrivateData("axCollection", key, axBytes)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("保存私有数据失败: %s", err))
+	}
+
+	// 返回Ciphertext结构体的bx部分
+	return shim.Success([]byte(fmt.Sprintf("bx: %v", ciphertext.bx)))
+}
+
+// Decrypt 方法从客户端接收解密份额，并将其与私有数据中的ax部分相加，得到明文的解密结果，并上传到最新区块
+func (s *SmartContract) Decrypt(stub shim.ChaincodeStubInterface, shares []*Ciphertext) pb.Response { 
+	// 检查解密份额是否为空 
+	if shares == nil { 
+		return shim.Error("解密份额不能为空")
+	}
+
+	// 检查解密份额的数量是否等于 num
+	if len(shares) != num {
+		return shim.Error(fmt.Sprintf("解密份额的数量不匹配: 预期 %d, 实际 %d", num, len(shares)))
+	}
+
+	// 从私有数据集合中获取之前保存的ax部分
+	axBytes, err := stub.GetPrivateData("axCollection", "latest_model")
+	if err != nil {
+		return shim.Error(fmt.Sprintf("获取私有数据失败: %s", err))
+	}
+
+	// 检查ax部分是否为空
+	if axBytes == nil {
+		return shim.Error("找不到对应的ax部分")
+	}
+
+	// 将ax部分反序列化为整数数组
+	var ax []int64
+	err = json.Unmarshal(axBytes, &ax)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("反序列化失败: %s", err))
+	}
+
+	// 创建一个Ciphertext结构体，用来存储ax部分和空的bx部分
+	cipher := &Ciphertext{
+		ax: ax,
+		bx: []int64{},
+	}
+
+	// 使用 addCipher 方法对 num 个解密份额进行累加
+	sum := Ciphertext{}
+	for i := 0; i < num; i++ {
+		sum = addCipher(sum, shares[i])
+	}
+
+	// 将累加结果与ax部分相加，得到明文的解密结果
+	result := addCipher(sum, cipher)
+
+	// 将明文的解密结果序列化为字节
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("序列化失败: %s", err))
+	}
+
+	// 将明文的解密结果上传到最新区块上
+	err = stub.PutState("latest_model", resultBytes)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("上传状态失败: %s", err))
 	}
 
 	// 将 num 恢复为 10
 	num = 10
-	return nil
-}
 
-// 定义一个查询函数，只返回 Ciphertext 里的 bx 部分 
-func (s *SmartContract) QueryBx(ctx contractapi.TransactionContextInterface) (string, error) {
-	// 从状态数据库中获取最新的加密模型 
-	encryptedModel, err := ctx.GetStub().GetState(“latest_model”) 
-	if err != nil { 
-		return “”, errors.Wrap(err, “failed to get state”) 
-	}
-
-	// 将加密模型转换为 Ciphertext 结构体
-	var ciphertext Ciphertext
-	err = json.Unmarshal(encryptedModel, &ciphertext)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to unmarshal ciphertext")
-	}
-
-	// 只返回 bx 部分
-	return ciphertext.Bx, nil
+	return shim.Success(nil)
 }
 
 func multikrum(noisyModel []float64) bool {
@@ -206,4 +296,11 @@ func equal(cipherA, cipherB Ciphertext) bool {
 		} 
 	}
 	return true
+}
+
+func main() {
+	err := shim.Start(new(SmartContract))
+	if err != nil {
+		fmt.Printf("Error starting SmartContract chaincode: %s", err)
+	}
 }

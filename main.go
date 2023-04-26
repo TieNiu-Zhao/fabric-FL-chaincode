@@ -7,7 +7,6 @@ import (
 	"os"
 
 	"github.com/hyperledger/fabric-sdk-go/pkg/client/channel"
-	"github.com/hyperledger/fabric-sdk-go/pkg/client/ledger"
 	"github.com/hyperledger/fabric-sdk-go/pkg/common/providers/fab"
 	"github.com/hyperledger/fabric-sdk-go/pkg/core/config"
 	"github.com/hyperledger/fabric-sdk-go/pkg/fabsdk"
@@ -28,78 +27,95 @@ type UpdateRequest struct {
 }
 
 func main() {
-	// Load the configuration file 
+	// 创建一个 fabric-sdk-go 的配置对象
 	configProvider := config.FromFile(“./config.yaml”)
 
-	// Create a Fabric SDK instance
+	// 创建一个 fabric-sdk-go 的实例
 	sdk, err := fabsdk.New(configProvider)
 	if err != nil {
-		fmt.Printf("Failed to create new SDK: %s\n", err)
+		fmt.Printf("创建 sdk 失败: %s\n", err)
 		os.Exit(1)
 	}
 	defer sdk.Close()
 
-	// Create a channel client
+	// 创建一个 channel.Client 实例
 	clientChannelContext := sdk.ChannelContext("mychannel", fabsdk.WithUser("User1"), fabsdk.WithOrg("Org1"))
 	client, err := channel.New(clientChannelContext)
 	if err != nil {
-		fmt.Printf("Failed to create new channel client: %s\n", err)
+		fmt.Printf("创建 channel 客户端失败: %s\n", err)
 		os.Exit(1)
 	}
 
-    // Create a ledger client
-    ledgerClient, err := ledger.New(clientChannelContext)
-    if err != nil {
-        fmt.Printf("Failed to create new ledger client: %s\n", err)
-        os.Exit(1)
-    }
+    // // Create a ledger client
+    // ledgerClient, err := ledger.New(clientChannelContext)
+    // if err != nil {
+    //     fmt.Printf("Failed to create new ledger client: %s\n", err)
+    //     os.Exit(1)
+    // }
 
-    // Loop through the proposal files
+    // 循环读取本地文件 proposal1~10.json，并上传到区块链上
 	for i := 1; i <= 10; i++ {
-		// Read the proposal file
-		filename := fmt.Sprintf("proposal%d.json", i)
-		data, err := ioutil.ReadFile(filename)
+		fileName := fmt.Sprintf("proposal%d.json", i)
+		fileBytes, err := ioutil.ReadFile(fileName)
 		if err != nil {
-			fmt.Printf("Failed to read file %s: %s\n", filename, err)
-			os.Exit(1)
+			fmt.Printf("读取文件 %s 失败: %s\n", fileName, err)
+			continue
 		}
 
-		// Unmarshal the proposal data
-		var proposal Proposal
-		err = json.Unmarshal(data, &proposal)
+		var proposal *Proposal
+		err = json.Unmarshal(fileBytes, &proposal)
 		if err != nil {
-			fmt.Printf("Failed to unmarshal proposal data: %s\n", err)
-			os.Exit(1)
+			fmt.Printf("反序列化文件 %s 失败: %s\n", fileName, err)
+			continue
 		}
 
-		// Prepare the arguments for invoking the chaincode
-		args := [][]byte{[]byte(proposal.EncryptedModel), []byte(proposal.EncryptedNoisy), []byte(proposal.EncryptedNoisyModel), []byte(proposal.NoisyModel)}
+		transientMap := make(map[string][]byte)
+		transientMap["proposal"] = fileBytes
 
-		// Invoke the chaincode with ProposeUpdate function
-		response, err := client.Execute(channel.Request{ChaincodeID: "mychaincode", Fcn: "ProposeUpdate", Args: args})
+		request := channel.Request{
+			ChaincodeID: "mycc",
+			Fcn:         "ProposeUpdate",
+			Args:        [][]byte{},
+			TransientMap: transientMap,
+		}
+
+		resp, err := client.SendRequest(request)
 		if err != nil {
-			fmt.Printf("Failed to invoke chaincode: %s\n", err)
-			os.Exit(1)
+			fmt.Printf("发送交易提案失败: %s\n", err)
+			continue
 		}
 
-		// Check the response status
-		if response.ChaincodeStatus != 200 {
-			fmt.Printf("Chaincode invocation failed: %s\n", response.Info)
-			os.Exit(1)
+		if resp.Status == fab.StatusOK {
+			fmt.Printf("上传文件 %s 成功\n", fileName)
+			fmt.Printf("响应内容: %s\n", string(resp.Payload))
+		} else {
+			fmt.Printf("上传文件 %s 失败\n", fileName)
+			fmt.Printf("响应状态: %d\n", resp.Status)
+			fmt.Printf("响应消息: %s\n", resp.Message)
+			continue
 		}
+	}
 
-		// Print the response payload
-		fmt.Printf("Response from chaincode: %s\n", string(response.Payload))
-    }
+	// 查询最新区块的 bx
+	request := channel.Request{
+		ChaincodeID: "mycc",
+		Fcn:         "query",
+		Args:        [][]byte{"latest_model"},
+	}
 
-    // Query the latest block from the ledger
-    block, err := ledgerClient.QueryBlockByTxID(fab.TransactionID(response.TransactionID))
-    if err != nil {
-        fmt.Printf("Failed to query block by txid: %s\n", err)
-        os.Exit(1)
-    }
+	resp, err := client.Query(request)
+	if err != nil {
+		fmt.Printf("查询最新区块的 bx 失败: %s\n", err)
+		os.Exit(1)
+	}
 
-    // Print the block number and data hash
-    fmt.Printf("Latest block number: %d\n", block.Header.Number)
-    fmt.Printf("Latest block data hash: %x\n", block.Header.DataHash)
+	if resp.Status == fab.StatusOK {
+		fmt.Printf("查询最新区块的 bx 成功\n")
+		fmt.Printf("响应内容: %s\n", string(resp.Payload))
+	} else {
+		fmt.Printf("查询最新区块的 bx 失败\n")
+		fmt.Printf("响应状态: %d\n", resp.Status)
+		fmt.Printf("响应消息: %s\n", resp.Message)
+		os.Exit(1)
+	}
 }

@@ -38,8 +38,18 @@ func (s *SmartContract) Init(stub shim.ChaincodeStubInterface) pb.Response {
 func (s *SmartContract) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 	// 获取函数名和参数
 	function, args := stub.GetFunctionAndParameters()
+	// Route to the appropriate handler function to interact with the ledger appropriately
+	if function == "ProposeUpdate" {
+		return s.ProposeUpdate(stub, args)
+	} else if function == "upload" {
+		return s.upload(stub, args)
+	} else if function == "query" {
+		return s.query(stub, args)
+	} else if function == "Decrypt" {
+		return s.Decrypt(stub, args)
+	}
 
-	
+	return shim.Error("Invalid Smart Contract function name.")
 }
 
 // ProposeUpdate 从客户端接收更新加密模型的提议，并将其广播到认可的 Peers 
@@ -144,7 +154,7 @@ func (s *SmartContract) upload(stub shim.ChaincodeStubInterface, update []byte) 
 // query 方法根据键查询最新块的内容
 func (s *SmartContract) query(stub shim.ChaincodeStubInterface, key string) pb.Response { 
 	// 检查键是否为空 
-	if key == “” { 
+	if key == "" { 
 		return shim.Error("键不能为空") 
 	}
 

@@ -3,10 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/hyperledger/fabric-chaincode-go/shim"
 	pb "github.com/hyperledger/fabric-protos-go/peer"
-) 
+)
 
 type Ciphertext struct {
 	ax []int64 // 实部
@@ -40,13 +41,23 @@ func (s *SmartContract) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 	function, args := stub.GetFunctionAndParameters()
 	// Route to the appropriate handler function to interact with the ledger appropriately
 	if function == "ProposeUpdate" {
-		return s.ProposeUpdate(stub, args)
+		var proposal *Proposal
+		err := json.Unmarshal([]byte(args[0]), &proposal)
+		if err != nil {
+			return shim.Error(fmt.Sprintf("反序列化提议失败: %s", err))
+		}
+		return s.ProposeUpdate(stub, proposal)
 	} else if function == "upload" {
-		return s.upload(stub, args)
+		return s.upload(stub)
 	} else if function == "query" {
-		return s.query(stub, args)
+		return s.query(stub, args[0])
 	} else if function == "Decrypt" {
-		return s.Decrypt(stub, args)
+		var shares []*Ciphertext
+		err := json.Unmarshal([]byte(args[0]), &shares)
+		if err != nil {
+			return shim.Error(fmt.Sprintf("反序列化解密份额失败: %s", err))
+		}
+		return s.Decrypt(stub, shares)	
 	}
 
 	return shim.Error("Invalid Smart Contract function name.")
@@ -73,16 +84,16 @@ func (s *SmartContract) ProposeUpdate(stub shim.ChaincodeStubInterface, proposal
 		return shim.Error("同态加法验证不通过")
 	}
 
-	// 如果验证通过，获取当前交易的背书结果
-	endorsements, err := stub.GetEndorsements()
+	signedProp, err := stub.GetSignedProposal()
 	if err != nil {
 		return shim.Error(fmt.Sprintf("获取背书结果失败: %s", err))
 	}
+	endorsements := signedProp.ProposalBytes
 
 	// 将背书结果与提议中的加密模型拼装成更新请求
 	update := &UpdateRequest{
 		EncryptedModel: proposal.EncryptedModel,
-		Endorsements:   endorsements,
+		Endorsements: []*pb.Endorsement,
 	}
 
 	// 将更新请求序列化为字节
@@ -92,7 +103,7 @@ func (s *SmartContract) ProposeUpdate(stub shim.ChaincodeStubInterface, proposal
 	}
 
 	// 调用 upload 方法将更新请求发送给排序节点
-	resp := s.upload(stub, updateBytes)
+	resp := s.upload(stub)
 	if resp.Status != shim.OK {
 		return resp
 	}
@@ -101,25 +112,9 @@ func (s *SmartContract) ProposeUpdate(stub shim.ChaincodeStubInterface, proposal
 }
 
 // upload 方法将更新请求发送给排序节点，并等待排序结果
-func (s *SmartContract) upload(stub shim.ChaincodeStubInterface, update []byte) pb.Response { 
-	// 检查更新请求是否为空
-	if update == nil {
-		return shim.Error("更新请求不能为空")
-	}
-
-	// 创建一个新的交易提案，指定链码名称、通道名称、函数名和参数
-	prop, _, err := stub.CreateProposalFromBytes("mycc", stub.GetChannelID(), "upload", [][]byte{update})
-	if err != nil {
-		return shim.Error(fmt.Sprintf("创建交易提案失败: %s", err))
-	}
-
-	// 将交易提案发送给排序节点，并等待排序结果
-	resp, err := stub.SendProposalToOrderer(prop)
-	if err != nil {
-		return shim.Error(fmt.Sprintf("发送交易提案失败: %s", err))
-	}
-
-	// 检查排序结果是否成功
+func (s *SmartContract) upload(stub shim.ChaincodeStubInterface) pb.Response { 
+	// 获取排序结果
+	resp := stub.GetTxValidationCode()
 	if resp.Status != shim.OK {
 		return resp
 	}
@@ -142,8 +137,12 @@ func (s *SmartContract) upload(stub shim.ChaincodeStubInterface, update []byte) 
 		sum = addCipher(sum, updates[i].EncryptedModel)
 	}
 
-	// 将累加结果上传到最新区块上
-	err = stub.PutState("latest_model", sum)
+	// 将累加结果上传到最新区块
+	sumBytes, err := json.Marshal(sum)
+	if err != nil {
+		return shim.Error(fmt.Sprintf("序列化失败: %s", err))
+	}
+	err = stub.PutState("latest_model", sumBytes)
 	if err != nil {
 		return shim.Error(fmt.Sprintf("failed to put state: %s", err))
 	}
@@ -229,11 +228,12 @@ func (s *SmartContract) Decrypt(stub shim.ChaincodeStubInterface, shares []*Ciph
 	// 使用 addCipher 方法对 num 个解密份额进行累加
 	sum := Ciphertext{}
 	for i := 0; i < num; i++ {
-		sum = addCipher(sum, shares[i])
+		sum = addCipher(sum, *shares[i])
 	}
 
 	// 将累加结果与ax部分相加，得到明文的解密结果
-	result := addCipher(sum, cipher)
+	var result Ciphertext
+	result = addCipher(sum, *cipher)
 
 	// 将明文的解密结果序列化为字节
 	resultBytes, err := json.Marshal(result)

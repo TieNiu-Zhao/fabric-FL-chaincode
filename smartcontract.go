@@ -314,3 +314,62 @@ func main() {
 		fmt.Printf("Error starting SmartContract chaincode: %s", err)
 	}
 }
+
+// upload1 接收客户端传入的十个proposal，进行验证和累加，然后上传到最新区块
+func (s *SmartContract) upload1(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	// 检查参数是否为十个proposal
+	if len(args) != 10 {
+		return shim.Error("参数个数错误，应为十个proposal")
+	}
+
+	// 定义一个切片存储通过验证的proposal
+	updates := make([]Proposal, 0)
+
+	// 遍历每个proposal，进行验证
+	for _, arg := range args {
+		// 将字符串参数转换为Proposal结构体
+		var proposal Proposal
+		err := json.Unmarshal([]byte(arg), &proposal)
+		if err != nil {
+			return shim.Error("参数格式错误，应为Proposal结构体的json字符串")
+		}
+
+		// 对提议中的加噪模型进行投毒检测
+		if !multikrum(proposal.NoisyModel) {
+			num--
+			return shim.Error("投毒检测不通过")
+		}
+
+		// 使用 addCipher 方法将提议中的加密模型与加密噪声相加
+		sum := addCipher(proposal.EncryptedModel, proposal.EncryptedNoisy)
+
+		// 检查加密模型与加密噪声的同态加法是否与提议中的加密加噪模型相等
+		if !equal(sum, proposal.EncryptedNoisyModel) {
+			num--
+			return shim.Error("同态加法验证不通过")
+		}
+
+		// 将通过验证的proposal添加到切片中
+		updates = append(updates, proposal)
+	}
+
+	// 使用 addCipher 方法对 num 个更新请求中的加密模型进行累加
+	sum := Ciphertext{}
+	for i := 0; i < num; i++ {
+		sum = addCipher(sum, updates[i].EncryptedModel)
+	}
+
+	// 将累加结果转换为json字符串
+	sumBytes, err := json.Marshal(sum)
+	if err != nil {
+		return shim.Error("累加结果转换为json字符串失败")
+	}
+
+	// 将累加结果上传到最新区块，使用"sum"作为键
+	err = stub.PutState("sum", sumBytes)
+	if err != nil {
+		return shim.Error("上传累加结果失败")
+	}
+
+	return shim.Success(nil)
+}
